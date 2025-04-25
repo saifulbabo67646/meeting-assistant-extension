@@ -153,7 +153,7 @@ window.onload = function ()
             if (mutation.type === "attributes")
             {
                 const targetElement = mutation.target;
-                if (targetElement.getAttribute('jscontroller') == "ES310d" && mutation.attributeName === 'class')
+                if (targetElement.getAttribute('jscontroller') == "YQvg8b" && mutation.attributeName === 'class')
                 {
                     if (targetElement.offsetParent !== null) // Check if the indicator element is visible
                     {
