@@ -62,6 +62,7 @@ var observer = new MutationSummary({
     { element: '.speaker-active-container__video-frame' },
     { element: '.speaker-bar-container__video-frame--active'},
     { element: '.gallery-video-container__video-frame--active'},
+    { element: '.multi-speaker-main-container__video-frame--active' },
   ]
 });
 
