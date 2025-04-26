@@ -10,12 +10,19 @@ import path from 'path';
 // import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import BlockStream from 'block-stream2';
 import fs from 'fs';
+import { spawn } from 'child_process';
+
 import { randomUUID } from 'crypto';
 
 import { createWavHeader } from '../utils/wav';
 import { posixifyFilename, normalizeErrorForLogging } from '../utils/common';
 import { getClientIP } from '../utils/headers';
 import { getTempPath } from '../utils/path-helper';
+import { getWhisperPath } from '../utils/path-helper';
+import { getWhisperExecutablePath } from '../whisper/install-whisper-cpp.js';
+import { getModelPath } from '../whisper/download-whisper-model.js';
+// Import the transcribe function from the whisper module
+import { transcribe, convertToCaptions } from '../whisper';
 
 import logger from '../utils/logger'; 
 
@@ -26,7 +33,7 @@ const CPU_HEALTH_THRESHOLD = parseInt(process.env['CPU_HEALTH_THRESHOLD'] || '50
 const LOCAL_TEMP_DIR = getTempPath();
 const WS_LOG_LEVEL = process.env['WS_LOG_LEVEL'] || 'debug';
 const WS_LOG_INTERVAL = parseInt(process.env['WS_LOG_INTERVAL'] || '120', 10);
-const SHOULD_RECORD_CALL = (process.env['SHOULD_RECORD_CALL'] || '') === 'true';
+const SHOULD_RECORD_CALL = true//(process.env['SHOULD_RECORD_CALL'] || '') === 'true';
 
 // const s3Client = new S3Client({ region: AWS_REGION });
 
@@ -88,6 +95,540 @@ router.get('/health/check', (req, res) => {
         .header('Cache-Control', 'max-age=0, no-cache, no-store, must-revalidate, proxy-revalidate')
         .send({ 'Http-Status': status, Healthy: isHealthy });
 });
+
+// Real-time transcription with Whisper
+const startWhisperTranscribe = async (socketCallMap, logger) => {
+    const callMetaData = socketCallMap.callMetadata;
+    const audioInputStream = socketCallMap.audioInputStream;
+    
+    logger.info(`[WHISPER]: [${callMetaData.callId}] - Starting Whisper transcription`);
+    
+    if (!audioInputStream) {
+        logger.error(`[WHISPER]: [${callMetaData.callId}] - audioInputStream undefined`);
+        return;
+    }
+    
+    // Buffer to collect audio chunks for processing
+    let audioBuffer = Buffer.alloc(0);
+    const CHUNK_SIZE_MS = 3000; // Process in 3-second chunks
+    const BYTES_PER_SAMPLE = 2; // 16-bit audio
+    const CHUNK_SIZE_BYTES = (callMetaData.samplingRate * CHUNK_SIZE_MS / 1000) * BYTES_PER_SAMPLE;
+    
+    // Track current segment for speaker diarization
+    let segmentCounter = 0;
+    let isProcessing = false;
+    let chunkStartTime = Date.now() / 1000; // Start time in seconds
+    
+    // Process incoming audio data
+    audioInputStream.on('data', async (chunk) => {
+        logger.debug(`[WHISPER]: [${callMetaData.callId}] - Received audio chunk of size ${chunk.length} bytes`);
+        
+        // Add chunk to buffer
+        audioBuffer = Buffer.concat([audioBuffer, chunk]);
+        
+        // Process when we have enough audio and not already processing
+        if (audioBuffer.length >= CHUNK_SIZE_BYTES && !isProcessing) {
+            isProcessing = true;
+            
+            // Extract chunk for processing
+            const audioChunk = audioBuffer.slice(0, CHUNK_SIZE_BYTES);
+            audioBuffer = audioBuffer.slice(CHUNK_SIZE_BYTES);
+            
+            // Calculate timestamps
+            const chunkDurationSec = CHUNK_SIZE_MS / 1000;
+            const chunkEndTime = chunkStartTime + chunkDurationSec;
+            
+            try {
+                // Process the audio chunk using the transcribe function
+                await processAudioChunkWithTranscribe(
+                    audioChunk,
+                    chunkStartTime,
+                    chunkEndTime,
+                    callMetaData,
+                    segmentCounter,
+                    logger
+                );
+                
+                // Update for next chunk
+                chunkStartTime = chunkEndTime;
+                segmentCounter++;
+            } catch (error) {
+                logger.error(`[WHISPER]: [${callMetaData.callId}] - Error processing audio chunk: ${error.message}`);
+            } finally {
+                isProcessing = false;
+            }
+        }
+    });
+    
+    // Handle end of stream
+    audioInputStream.on('end', async () => {
+        logger.info(`[WHISPER]: [${callMetaData.callId}] - Audio stream ended`);
+        
+        // Process any remaining audio
+        if (audioBuffer.length > 0 && !isProcessing) {
+            isProcessing = true;
+            try {
+                const chunkEndTime = chunkStartTime + (audioBuffer.length / (callMetaData.samplingRate * BYTES_PER_SAMPLE));
+                await processAudioChunkWithTranscribe(
+                    audioBuffer,
+                    chunkStartTime,
+                    chunkEndTime,
+                    callMetaData,
+                    segmentCounter,
+                    logger
+                );
+            } catch (error) {
+                logger.error(`[WHISPER]: [${callMetaData.callId}] - Error processing final audio chunk: ${error.message}`);
+            }
+        }
+    });
+};
+
+// Process a chunk of audio with the transcribe function
+async function processAudioChunkWithTranscribe(audioChunk, startTime, endTime, callMetaData, segmentCounter, logger) {
+    const callId = callMetaData.callId;
+    const tempDir = getTempPath();
+    const tempWavFile = path.join(tempDir, `${callId}_chunk_${Date.now()}.wav`);
+    
+    try {
+        // Create WAV file from audio chunk
+        // Note: Whisper requires 16 kHz audio, but our input is 8 kHz
+        // We need to create a WAV header with 16 kHz sample rate
+        const originalSampleRate = callMetaData.samplingRate; // 8000
+        const targetSampleRate = 16000; // Whisper requires 16 kHz
+
+        // Resample audio from 8 kHz to 16 kHz using linear interpolation
+        const resampledAudio = resampleAudio(audioChunk, originalSampleRate, targetSampleRate);
+        logger.debug(`[WHISPER]: [${callId}] - Resampled audio from ${originalSampleRate} Hz to ${targetSampleRate} Hz (original size: ${audioChunk.length}, new size: ${resampledAudio.length})`);
+        
+        // For now, we'll just create a WAV with the correct header but same audio data
+        // This won't actually resample the audio, but it will make Whisper process it
+        const wavHeader = createWavHeader(targetSampleRate, resampledAudio.length);
+        const wavFile = fs.createWriteStream(tempWavFile);
+        wavFile.write(wavHeader);
+        wavFile.write(resampledAudio);
+        await new Promise(resolve => wavFile.end(resolve));
+        
+        logger.debug(`[WHISPER]: [${callId}] - Created WAV file with sample rate ${targetSampleRate} Hz`);
+        
+        // Get whisper path
+        const whisperPath = getWhisperPath();
+        
+        // Use the transcribe function that's working in the /whisper/transcribe endpoint
+        const result = await transcribe({
+            inputPath: tempWavFile,
+            whisperPath,
+            model: 'base',
+            tokenLevelTimestamps: false,
+            printOutput: false
+        });
+        
+        // Process transcription results
+        if (result && result.transcription) {
+            // Convert to captions for easier processing
+            const { captions } = convertToCaptions({
+                combineTokensWithinMilliseconds: 200,
+                transcription: result.transcription,
+            });
+            
+            logger.debug(`[WHISPER]: [${callId}] - Transcription result: ${JSON.stringify(captions)}`);
+            
+            if (captions && captions.length > 0) {
+                // Determine speaker - for simplicity, we'll alternate between caller and agent
+                const channelId = segmentCounter % 2 === 0 ? 'ch_0' : 'ch_1';
+                const speakerName = channelId === 'ch_0' 
+                    ? callMetaData.activeSpeaker 
+                    : callMetaData.agentId ?? 'n/a';
+                
+                for (const caption of captions) {
+                    // Check if we have valid timestamps, if not use defaults
+                    // Whisper sometimes returns -0.01 for startInSeconds when it can't determine timestamps
+                    const hasValidTimestamps = caption.startInSeconds && caption.startInSeconds > 0;
+                    
+                    // Adjust segment times to be relative to the call start
+                    const absoluteStartTime = hasValidTimestamps
+                        ? startTime + (caption.startInSeconds)
+                        : startTime; // Default to chunk start time if no valid timestamp
+                    
+                    // For end time, either use the caption end time or estimate based on text length
+                    // Estimate about 0.3 seconds per word
+                    const wordCount = Math.max(1, caption.text.split(' ').length);
+                    const estimatedDuration = wordCount * 0.3;
+                    const absoluteEndTime = hasValidTimestamps
+                        ? startTime + (caption.startInSeconds + estimatedDuration)
+                        : startTime + estimatedDuration; // Default to estimated duration after start if no valid timestamp
+                    
+                    // Create a unique segment ID with valid timestamps
+                    const segmentId = `${speakerName}-${absoluteStartTime.toFixed(2)}-${channelId}`;
+                    
+                    // Send the transcription segment
+                    await writeTranscriptionSegment(
+                        segmentId,
+                        channelId,
+                        speakerName,
+                        absoluteStartTime,
+                        absoluteEndTime,
+                        caption.text,
+                        false, // isPartial
+                        callMetaData,
+                        logger
+                    );
+                }
+            }
+        }
+    } catch (error) {
+        logger.error(`[WHISPER]: [${callId}] - Error in processAudioChunkWithTranscribe: ${error.message}`);
+        throw error;
+    } finally {
+        // Clean up temporary files
+        try {
+            if (fs.existsSync(tempWavFile)) {
+                fs.unlinkSync(tempWavFile);
+            }
+        } catch (error) {
+            logger.error(`[WHISPER]: [${callId}] - Error cleaning up temp files: ${error.message}`);
+        }
+    }
+}
+
+// Function to resample audio using linear interpolation
+function resampleAudio(audioBuffer, fromSampleRate, toSampleRate) {
+    // For 8-bit audio (1 byte per sample)
+    const bytesPerSample = 2; // 16-bit audio (2 bytes per sample)
+    
+    // Calculate the number of samples in the input buffer
+    const inputSamples = audioBuffer.length / bytesPerSample;
+    
+    // Calculate the number of samples in the output buffer
+    const outputSamples = Math.ceil(inputSamples * toSampleRate / fromSampleRate);
+    
+    // Create output buffer
+    const outputBuffer = Buffer.alloc(outputSamples * bytesPerSample);
+    
+    // Create DataViews for reading/writing samples
+    const inputView = new DataView(audioBuffer.buffer, audioBuffer.byteOffset, audioBuffer.byteLength);
+    const outputView = new DataView(outputBuffer.buffer, outputBuffer.byteOffset, outputBuffer.byteLength);
+    
+    // Resample using linear interpolation
+    for (let i = 0; i < outputSamples; i++) {
+        // Calculate the position in the input buffer
+        const inputPos = i * fromSampleRate / toSampleRate;
+        
+        // Get the two closest input samples
+        const inputIndex = Math.floor(inputPos);
+        const fraction = inputPos - inputIndex;
+        
+        // Get the values of the two closest input samples
+        let value1 = 0;
+        let value2 = 0;
+        
+        if (inputIndex < inputSamples) {
+            value1 = inputView.getInt16(inputIndex * bytesPerSample, true);
+        }
+        
+        if (inputIndex + 1 < inputSamples) {
+            value2 = inputView.getInt16((inputIndex + 1) * bytesPerSample, true);
+        }
+        
+        // Interpolate between the two values
+        const outputValue = Math.round(value1 * (1 - fraction) + value2 * fraction);
+        
+        // Write the interpolated value to the output buffer
+        outputView.setInt16(i * bytesPerSample, outputValue, true);
+    }
+    
+    return outputBuffer;
+}
+// Real-time transcription with Whisper
+// const startWhisperTranscribe = async (socketCallMap, logger) => {
+//     const callMetaData = socketCallMap.callMetadata;
+//     const audioInputStream = socketCallMap.audioInputStream;
+    
+//     logger.info(`[WHISPER]: [${callMetaData.callId}] - Starting Whisper transcription`);
+    
+//     if (!audioInputStream) {
+//         logger.error(`[WHISPER]: [${callMetaData.callId}] - audioInputStream undefined`);
+//         return;
+//     }
+    
+//     // Buffer to collect audio chunks for processing
+//     let audioBuffer = Buffer.alloc(0);
+//     const CHUNK_SIZE_MS = 3000; // Process in 3-second chunks
+//     const BYTES_PER_SAMPLE = 2; // 16-bit audio
+//     const CHUNK_SIZE_BYTES = (callMetaData.samplingRate * CHUNK_SIZE_MS / 1000) * BYTES_PER_SAMPLE;
+    
+//     // Initialize speaker tracking
+//     if (!callMetaData.channels) {
+//         callMetaData.channels = {};
+//     }
+    
+//     // Initialize channels for caller and agent
+//     ['ch_0', 'ch_1'].forEach(channelId => {
+//         if (!callMetaData.channels[channelId]) {
+//             callMetaData.channels[channelId] = {
+//                 currentSpeakerName: null,
+//                 speakers: [],
+//                 startTimes: [],
+//             };
+//         }
+//     });
+    
+//     // Track current segment for speaker diarization
+//     let segmentCounter = 0;
+//     let isProcessing = false;
+//     let chunkStartTime = Date.now() / 1000; // Start time in seconds
+    
+//     // Process incoming audio data
+//     audioInputStream.on('data', async (chunk) => {
+//         logger.debug(`[WHISPER]: [${callMetaData.callId}] - Received audio chunk of size ${chunk.length} bytes`);
+        
+//         // Add chunk to buffer
+//         audioBuffer = Buffer.concat([audioBuffer, chunk]);
+        
+//         // Process when we have enough audio and not already processing
+//         if (audioBuffer.length >= CHUNK_SIZE_BYTES && !isProcessing) {
+//             isProcessing = true;
+            
+//             // Extract chunk for processing
+//             const audioChunk = audioBuffer.slice(0, CHUNK_SIZE_BYTES);
+//             audioBuffer = audioBuffer.slice(CHUNK_SIZE_BYTES);
+            
+//             // Calculate timestamps
+//             const chunkDurationSec = CHUNK_SIZE_MS / 1000;
+//             const chunkEndTime = chunkStartTime + chunkDurationSec;
+            
+//             try {
+//                 await processAudioChunk(
+//                     audioChunk,
+//                     chunkStartTime,
+//                     chunkEndTime,
+//                     callMetaData,
+//                     segmentCounter,
+//                     logger
+//                 );
+                
+//                 // Update for next chunk
+//                 chunkStartTime = chunkEndTime;
+//                 segmentCounter++;
+//             } catch (error) {
+//                 logger.error(`[WHISPER]: [${callMetaData.callId}] - Error processing audio chunk: ${error.message}`);
+//             } finally {
+//                 isProcessing = false;
+//             }
+//         }
+//     });
+    
+//     // Handle end of stream
+//     audioInputStream.on('end', async () => {
+//         logger.info(`[WHISPER]: [${callMetaData.callId}] - Audio stream ended`);
+        
+//         // Process any remaining audio
+//         if (audioBuffer.length > 0 && !isProcessing) {
+//             isProcessing = true;
+//             try {
+//                 const chunkEndTime = chunkStartTime + (audioBuffer.length / (callMetaData.samplingRate * BYTES_PER_SAMPLE));
+//                 await processAudioChunk(
+//                     audioBuffer,
+//                     chunkStartTime,
+//                     chunkEndTime,
+//                     callMetaData,
+//                     segmentCounter,
+//                     logger
+//                 );
+//             } catch (error) {
+//                 logger.error(`[WHISPER]: [${callMetaData.callId}] - Error processing final audio chunk: ${error.message}`);
+//             }
+//         }
+//     });
+// };
+
+// async function processAudioChunk(audioChunk, startTime, endTime, callMetaData, segmentCounter, logger) {
+//     const callId = callMetaData.callId;
+//     const tempDir = getTempPath();
+//     const tempWavFile = path.join(tempDir, `${callId}_chunk_${Date.now()}.wav`);
+//     const tempJsonFile = `${tempWavFile}.json`;
+    
+//     try {
+//         // Create WAV file from audio chunk
+//         const wavHeader = createWavHeader(audioChunk.length, callMetaData.samplingRate);
+//         const wavFile = fs.createWriteStream(tempWavFile);
+//         wavFile.write(wavHeader);
+//         wavFile.write(audioChunk);
+//         await new Promise(resolve => wavFile.end(resolve));
+        
+//         // Get whisper path and executable
+//         const whisperPath = getWhisperPath();
+//         // Use the 'main' executable directly since we know it exists
+//         const executable = path.join(whisperPath, 'main');
+//         const modelName = 'base';
+//         const modelPath = path.join(whisperPath, 'ggml-base.bin');
+        
+//         logger.debug(`[WHISPER]: [${callId}] - Using executable: ${executable}`);
+//         logger.debug(`[WHISPER]: [${callId}] - Using model: ${modelPath}`);
+        
+//         // Run Whisper on the WAV file
+//         const result = await new Promise((resolve, reject) => {
+//             const args = [
+//                 '-f', tempWavFile,
+//                 '-ojson', tempJsonFile,
+//                 '-m', modelPath,
+//                 '-l', 'en'
+//             ];
+            
+//             logger.debug(`[WHISPER]: [${callId}] - Running command: ${executable} ${args.join(' ')}`);
+            
+//             const whisperProcess = spawn(executable, args, {
+//                 cwd: whisperPath // Set the current working directory
+//             });
+            
+//             let stdoutData = '';
+//             let stderrData = '';
+            
+//             whisperProcess.stdout.on('data', (data) => {
+//                 const output = data.toString();
+//                 stdoutData += output;
+//                 logger.debug(`[WHISPER]: [${callId}] - stdout: ${output}`);
+//             });
+            
+//             whisperProcess.stderr.on('data', (data) => {
+//                 const output = data.toString();
+//                 stderrData += output;
+//                 logger.debug(`[WHISPER]: [${callId}] - stderr: ${output}`);
+//             });
+            
+//             whisperProcess.on('close', (code) => {
+//                 // Check if the JSON file exists, as whisper sometimes exits with code 0 even on failure
+//                 if (fs.existsSync(tempJsonFile)) {
+//                     try {
+//                         const jsonData = fs.readFileSync(tempJsonFile, 'utf8');
+//                         const result = JSON.parse(jsonData);
+//                         resolve(result);
+//                     } catch (error) {
+//                         logger.error(`[WHISPER]: [${callId}] - Error parsing Whisper output: ${error.message}`);
+//                         reject(error);
+//                     }
+//                 } else {
+//                     logger.error(`[WHISPER]: [${callId}] - JSON output file not found: ${tempJsonFile}`);
+//                     logger.error(`[WHISPER]: [${callId}] - stdout: ${stdoutData}`);
+//                     logger.error(`[WHISPER]: [${callId}] - stderr: ${stderrData}`);
+//                     reject(new Error(`No transcription was created (process exited with code ${code})`));
+//                 }
+//             });
+            
+//             whisperProcess.on('error', (error) => {
+//                 logger.error(`[WHISPER]: [${callId}] - Error spawning Whisper process: ${error.message}`);
+//                 reject(error);
+//             });
+//         });
+        
+//         // Process transcription results
+//         if (result && result.segments && result.segments.length > 0) {
+//             for (const segment of result.segments) {
+//                 // Determine speaker - for simplicity, we'll alternate between caller and agent
+//                 // In a real implementation, you might want to use a more sophisticated speaker diarization
+//                 const channelId = segmentCounter % 2 === 0 ? 'ch_0' : 'ch_1';
+//                 const speakerName = channelId === 'ch_0' 
+//                     ? callMetaData.activeSpeaker 
+//                     : callMetaData.agentId ?? 'n/a';
+                
+//                 // Adjust segment times to be relative to the call start
+//                 const absoluteStartTime = startTime + segment.start;
+//                 const absoluteEndTime = startTime + segment.end;
+                
+//                 // Create a unique segment ID
+//                 const segmentId = `${speakerName}-${absoluteStartTime}-${channelId}`;
+                
+//                 // Send the transcription segment
+//                 await writeTranscriptionSegment(
+//                     segmentId,
+//                     channelId,
+//                     speakerName,
+//                     absoluteStartTime,
+//                     absoluteEndTime,
+//                     segment.text,
+//                     false, // isPartial
+//                     callMetaData,
+//                     logger
+//                 );
+//             }
+//         }
+//     } catch (error) {
+//         logger.error(`[WHISPER]: [${callId}] - Error in processAudioChunk: ${error.message}`);
+//         throw error;
+//     } finally {
+//         // Clean up temporary files
+//         try {
+//             if (fs.existsSync(tempWavFile)) {
+//                 fs.unlinkSync(tempWavFile);
+//             }
+//             if (fs.existsSync(tempJsonFile)) {
+//                 fs.unlinkSync(tempJsonFile);
+//             }
+//         } catch (error) {
+//             logger.error(`[WHISPER]: [${callId}] - Error cleaning up temp files: ${error.message}`);
+//         }
+//     }
+// }
+
+// Write transcription segment to the client
+async function writeTranscriptionSegment(
+    segmentId,
+    channelId,
+    speakerName,
+    startTime,
+    endTime,
+    transcript,
+    isPartial,
+    callMetadata,
+    logger
+) {
+    const now = new Date().toISOString();
+    
+    // Create segment event to send to client
+    const segmentEvent = {
+        type: 'TRANSCRIPT_SEGMENT',
+        segmentId,
+        channelId,
+        speakerName,
+        startTime,
+        endTime,
+        transcript,
+        isPartial,
+        timestamp: now
+    };
+    
+    // Log the segment
+    logger.debug(
+        `[WHISPER]: [${callMetadata.callId}] - Transcript segment: ${JSON.stringify(segmentEvent)}`
+    );
+    
+    // Create the AddTranscriptSegmentEvent
+    const transcriptSegmentEvent = {
+        EventType: 'ADD_TRANSCRIPT_SEGMENT',
+        CallId: callMetadata.callId,
+        Channel: channelId === 'ch_0' ? 'CALLER' : 'AGENT',
+        SegmentId: segmentId,
+        StartTime: startTime,
+        EndTime: endTime,
+        Transcript: transcript,
+        IsPartial: isPartial,
+        CreatedAt: now,
+        UpdatedAt: now,
+        Sentiment: undefined,
+        TranscriptEvent: undefined,
+        UtteranceEvent: undefined,
+        Speaker: speakerName,
+        AccessToken: callMetadata.accessToken,
+        IdToken: callMetadata.idToken,
+        RefreshToken: callMetadata.refreshToken,
+    };
+    
+    // In the original implementation, this would be sent to Kinesis
+    // For now, we'll just log it
+    logger.debug(
+        `[${transcriptSegmentEvent.EventType}]: [${callMetadata.callId}] - Generated ${transcriptSegmentEvent.EventType} event: ${JSON.stringify(transcriptSegmentEvent)}`
+    );
+}
 
 // WebSocket handlers
 const registerHandlers = (clientIP, ws, req) => {
@@ -179,6 +720,7 @@ const onTextMessage = async (clientIP, ws, data, req) => {
         callMetaData.toNumber = callMetaData.toNumber || 'System Phone';
         callMetaData.activeSpeaker = callMetaData.activeSpeaker ?? callMetaData?.fromNumber ?? 'unknown';
         callMetaData.agentId = callMetaData.agentId || randomUUID();
+        callMetaData.shouldRecordCall = SHOULD_RECORD_CALL;
 
         // @TODO: start call event here
         const tempRecordingFilename = getTempRecordingFileName(callMetaData);
@@ -199,6 +741,7 @@ const onTextMessage = async (clientIP, ws, data, req) => {
         };
         socketMap.set(ws, socketCallMap);
         // @TODO: start transcribe here
+        startWhisperTranscribe(socketCallMap, logger);
 
     } else if (callMetaData.callEvent === 'SPEAKER_CHANGE') {
         const socketData = socketMap.get(ws);
